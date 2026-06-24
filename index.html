@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Scroll-Frame Website</title>
+
+<!--
+  ============================================================================
+  SCROLL-FRAME SEQUENCE TEMPLATE
+  ----------------------------------------------------------------------------
+  A "scroll-scrubbed frame sequence". Instead of WebGL/Three.js, we:
+    1. Preload a sequence of still frames (frames/frame_0001.jpg ...).
+    2. Pin a full-bleed <canvas> behind the page.
+    3. Map window scroll progress -> frame index, with eased interpolation,
+       so scrolling literally "plays the film" = a 3D / parallax feel that
+       uses native scroll and works on every device.
+    4. Overlay HTML text blocks in the frame's negative-space zones,
+       revealed on scroll via IntersectionObserver.
+
+  No external dependencies. Drop your own frames into /frames and adjust the
+  CONFIG block below. Deploys as static files (e.g. Vercel, framework "Other").
+
+  This is an original implementation of the common scroll-image-sequence
+  technique. No third-party code, presets, or assets are used.
+  ============================================================================
+-->
+
+<style>
+  :root {
+    --gold: #d9b45a;
+    --gold-soft: #c9a86a;
+    --ink: #0a0a0c;
+    --text-dim: rgba(245, 240, 230, 0.72);
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  html { scroll-behavior: auto; }
+
+  body {
+    background: var(--ink);
+    color: #f5f0e6;
+    font-family: "Helvetica Neue", Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    overflow-x: hidden;
+  }
+
+  /* The pinned canvas sits fixed behind all content. */
+  #scene {
+    position: fixed;
+    inset: 0;
+    width: 100vw;
+    height: 100vh;
+    z-index: 0;
+    display: block;
+    background: var(--ink);
+  }
+
+  /* Loading indicator while frames preload. */
+  #loader {
+    position: fixed;
+    inset: 0;
+    z-index: 50;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-direction: column;
+    gap: 18px;
+    background: var(--ink);
+    transition: opacity 0.8s ease;
+    color: var(--gold);
+    letter-spacing: 0.25em;
+    font-size: 12px;
+    text-transform: uppercase;
+  }
+  #loader.hidden { opacity: 0; pointer-events: none; }
+  #loaderBar {
+    width: 180px; height: 1px; background: rgba(217,180,90,0.2);
+    position: relative; overflow: hidden;
+  }
+  #loaderBar > span {
+    position: absolute; left: 0; top: 0; height: 100%; width: 0%;
+    background: var(--gold); transition: width 0.2s linear;
+  }
+
+  /* Scroll track: this element's height defines how much "film" there is. */
+  #track { position: relative; z-index: 1; }
+
+  /* Each pinned text section is one viewport tall. */
+  .panel {
+    min-height: 100vh;
+    display: flex;
+    padding: 8vw;
+    position: relative;
+  }
+  .panel .block {
+    max-width: 520px;
+    opacity: 0;
+    transform: translateY(40px);
+    transition: opacity 1s ease, transform 1s ease;
+  }
+  .panel.in .block { opacity: 1; transform: translateY(0); }
+
+  /* Position blocks into the frame's negative-space zones.
+     The demo footage keeps a darker diagonal band through the middle, so
+     these alignments drop text where the image is calm. Tune per footage. */
+  .left   { align-items: center; justify-content: flex-start; }
+  .right  { align-items: center; justify-content: flex-end; text-align: right; }
+  .center { align-items: center; justify-content: center; text-align: center; }
+  .right .block  { margin-left: auto; }
+  .center .block { margin: 0 auto; }
+
+  .eyebrow {
+    font-size: 12px; letter-spacing: 0.4em; text-transform: uppercase;
+    color: var(--gold); margin-bottom: 18px;
+  }
+  .headline {
+    font-size: clamp(34px, 6vw, 76px); line-height: 1.02; font-weight: 600;
+    letter-spacing: -0.01em; margin-bottom: 22px;
+  }
+  .headline em { color: var(--gold); font-style: normal; }
+  .subtext { font-size: clamp(15px, 1.6vw, 19px); line-height: 1.6; color: var(--text-dim); }
+
+  /* Subtle readability scrim so text never fights the footage. */
+  .panel::before {
+    content: ""; position: absolute; inset: 0; z-index: -1; pointer-events: none;
+    background: radial-gradient(60% 60% at var(--scrim-x, 30%) 50%,
+                rgba(10,10,12,0.55), rgba(10,10,12,0) 70%);
+  }
+  .right::before  { --scrim-x: 70%; }
+  .center::before { --scrim-x: 50%; }
+
+  .scroll-hint {
+    position: fixed; bottom: 26px; left: 50%; transform: translateX(-50%);
+    z-index: 5; color: var(--gold); font-size: 11px; letter-spacing: 0.3em;
+    text-transform: uppercase; opacity: 0.7; transition: opacity 0.4s;
+  }
+
+  /* ---- Reduced-motion fallback: static key frame, never blank ----
+     If the user prefers reduced motion we skip the scroll scrubbing and the
+     JS paints a single key frame once. Text is shown immediately. */
+  @media (prefers-reduced-motion: reduce) {
+    .panel .block { opacity: 1 !important; transform: none !important; }
+    .scroll-hint { display: none; }
+  }
+</style>
+</head>
+<body>
+
+  <!-- Pinned full-bleed canvas the frames are drawn to. -->
+  <canvas id="scene"></canvas>
+
+  <div id="loader">
+    <div>Loading</div>
+    <div id="loaderBar"><span></span></div>
+  </div>
+
+  <div class="scroll-hint">Scroll</div>
+
+  <!-- Scroll track + overlaid text panels positioned over negative space. -->
+  <main id="track">
+    <section class="panel left">
+      <div class="block">
+        <p class="eyebrow">Studio / 2026</p>
+        <h1 class="headline">Light that <em>moves</em> when you do.</h1>
+        <p class="subtext">A cinematic scroll experience built from a single
+        rendered sequence — no 3D engine, no plugins. Just frames and scroll.</p>
+      </div>
+    </section>
+
+    <section class="panel right">
+      <div class="block">
+        <p class="eyebrow">The technique</p>
+        <h2 class="headline">Scroll <em>is</em> the timeline.</h2>
+        <p class="subtext">Every pixel you scroll advances the film. The canvas
+        is pinned; the story plays through it. Native scroll, every device.</p>
+      </div>
+    </section>
+
+    <section class="panel center">
+      <div class="block">
+        <p class="eyebrow">Negative space</p>
+        <h2 class="headline">Text lives where the <em>frame is quiet</em>.</h2>
+        <p class="subtext">Headlines are placed over the calm zones of the
+        footage, so the imagery and the message never compete.</p>
+      </div>
+    </section>
+
+    <section class="panel left">
+      <div class="block">
+        <p class="eyebrow">Ship it</p>
+        <h2 class="headline">Static files. <em>Instant</em> deploy.</h2>
+        <p class="subtext">Drop your frames in, push to GitHub, deploy to Vercel
+        as "Other". That's the whole pipeline.</p>
+      </div>
+    </section>
+  </main>
+
+<script>
+/* =========================================================================
+   CONFIG — edit these to match your own frame sequence.
+   ========================================================================= */
+const CONFIG = {
+  framePath:   "frames/",        // folder containing the sequence
+  framePrefix: "frame_",         // filename prefix
+  frameExt:    ".jpg",           // file extension
+  padLength:   4,                // zero-padding width (frame_0001 -> 4)
+  frameCount:  300,              // total number of frames in the sequence
+  firstIndex:  1,                // first frame number on disk
+  ease:        0.08,             // 0..1 — lower = smoother/laggier scrub
+  keyFrame:    0.5,              // fraction (0..1) used for static fallback
+};
+
+/* ---- helpers ---------------------------------------------------------- */
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+const pad   = n => String(n).padStart(CONFIG.padLength, "0");
+const srcFor = i => `${CONFIG.framePath}${CONFIG.framePrefix}${pad(i)}${CONFIG.frameExt}`;
+
+const canvas = document.getElementById("scene");
+const ctx    = canvas.getContext("2d", { alpha: false });
+const loader = document.getElementById("loader");
+const loaderBar = document.querySelector("#loaderBar > span");
+const scrollHint = document.querySelector(".scroll-hint");
+
+const prefersReduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+const frames = new Array(CONFIG.frameCount); // Image objects, lazily filled
+let loadedCount = 0;
+let drawnIndex  = -1;
+let targetIndex = 0;   // where scroll says we should be
+let currentIndex = 0;  // eased position actually drawn
+
+/* ---- canvas sizing: cover-fit each frame to the viewport -------------- */
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2); // cap DPR for perf
+  canvas.width  = Math.floor(window.innerWidth  * dpr);
+  canvas.height = Math.floor(window.innerHeight * dpr);
+  canvas.style.width  = window.innerWidth + "px";
+  canvas.style.height = window.innerHeight + "px";
+  drawnIndex = -1; // force a redraw at new size
+}
+
+function drawCover(img) {
+  if (!img || !img.complete || !img.naturalWidth) return;
+  const cw = canvas.width, ch = canvas.height;
+  const ir = img.naturalWidth / img.naturalHeight;
+  const cr = cw / ch;
+  let dw, dh, dx, dy;
+  if (cr > ir) { dw = cw; dh = cw / ir; dx = 0; dy = (ch - dh) / 2; }
+  else         { dh = ch; dw = ch * ir; dy = 0; dx = (cw - dw) / 2; }
+  ctx.drawImage(img, dx, dy, dw, dh);
+}
+
+/* Draw the nearest loaded frame to `idx` (so we never flash blank while a
+   specific frame is still streaming in). */
+function paint(idx) {
+  idx = clamp(Math.round(idx), 0, CONFIG.frameCount - 1);
+  if (idx === drawnIndex) return;
+  let img = frames[idx];
+  if (!img || !img.complete || !img.naturalWidth) {
+    // search outward for the closest already-decoded frame
+    let found = null;
+    for (let r = 1; r < CONFIG.frameCount; r++) {
+      const lo = frames[idx - r], hi = frames[idx + r];
+      if (lo && lo.complete && lo.naturalWidth) { found = lo; break; }
+      if (hi && hi.complete && hi.naturalWidth) { found = hi; break; }
+    }
+    img = found;
+  }
+  if (img) { drawCover(img); drawnIndex = idx; }
+}
+
+/* ---- scroll -> target frame ------------------------------------------- */
+function scrollProgress() {
+  const max = document.body.scrollHeight - window.innerHeight;
+  return max > 0 ? clamp(window.scrollY / max, 0, 1) : 0;
+}
+
+function onScroll() {
+  targetIndex = scrollProgress() * (CONFIG.frameCount - 1);
+  if (scrollHint) scrollHint.style.opacity = window.scrollY > 40 ? "0" : "0.7";
+}
+
+/* ---- render loop: ease currentIndex toward targetIndex ---------------- */
+let rafPending = false;
+function loop() {
+  rafPending = false;
+  const diff = targetIndex - currentIndex;
+  if (Math.abs(diff) < 0.05) currentIndex = targetIndex;
+  else currentIndex += diff * CONFIG.ease;
+  paint(currentIndex);
+  if (Math.abs(targetIndex - currentIndex) > 0.05) request();
+}
+function request() { if (!rafPending) { rafPending = true; requestAnimationFrame(loop); } }
+
+/* ---- progressive / lazy preloading -----------------------------------
+   We load frames in passes so the first paint happens fast:
+   pass 1: every Nth frame (a coarse skeleton of the whole sequence)
+   pass 2: fill in the gaps.
+   Frames are decoded off the main thread where supported. */
+function loadFrame(i) {
+  if (frames[i]) return Promise.resolve();
+  return new Promise(resolve => {
+    const img = new Image();
+    img.decoding = "async";
+    img.onload = img.onerror = () => {
+      loadedCount++;
+      loaderBar.style.width = Math.round((loadedCount / CONFIG.frameCount) * 100) + "%";
+      if (i === firstToShow) { paint(0); revealLoader(); }
+      resolve();
+    };
+    img.src = srcFor(CONFIG.firstIndex + i);
+    frames[i] = img;
+  });
+}
+
+let firstToShow = 0;
+function revealLoader() { loader.classList.add("hidden"); }
+
+async function preload() {
+  // Static fallback: paint one key frame, show text, skip scrubbing entirely.
+  if (prefersReduced) {
+    const k = Math.round(CONFIG.keyFrame * (CONFIG.frameCount - 1));
+    firstToShow = k;
+    await loadFrame(k);
+    paint(k);
+    revealLoader();
+    return; // no scroll listeners, no rAF loop
+  }
+
+  // Pass 1: coarse skeleton (~every 12th frame) so motion is usable early.
+  const stride = 12;
+  const skeleton = [];
+  for (let i = 0; i < CONFIG.frameCount; i += stride) skeleton.push(i);
+  // load frame 0 first so we can reveal immediately
+  await loadFrame(0);
+  await Promise.all(skeleton.map(loadFrame));
+
+  // Pass 2: fill remaining frames in the background (don't block interaction).
+  for (let i = 0; i < CONFIG.frameCount; i++) {
+    if (!frames[i]) loadFrame(i); // fire-and-forget, throttled by the browser
+  }
+
+  // wire up interaction
+  onScroll();
+  request();
+}
+
+/* ---- IntersectionObserver: reveal text panels ------------------------- */
+function observePanels() {
+  const io = new IntersectionObserver((entries) => {
+    entries.forEach(e => { if (e.isIntersecting) e.target.classList.add("in"); });
+  }, { threshold: 0.35 });
+  document.querySelectorAll(".panel").forEach(p => io.observe(p));
+}
+
+/* ---- boot ------------------------------------------------------------- */
+resize();
+observePanels();
+preload();
+
+if (!prefersReduced) {
+  window.addEventListener("scroll", onScroll, { passive: true });
+  window.addEventListener("resize", () => { resize(); request(); }, { passive: true });
+}
+</script>
+</body>
+</html>
